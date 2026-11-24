@@ -16,6 +16,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
+import yaml
 
 from assignment.env import Environment
 from assignment.agent.tools import INVOKE_SKILL_TOOL
@@ -152,6 +153,10 @@ class Agent:
 
         # TODO(1.1.a): Add machinery to maintain agent state as it takes actions
         # and observes the results.
+        # The interaction so far, in order: each assistant message followed by
+        # the tool observations it produced. The system and task messages are
+        # not stored here; build_prompt adds them in front on every step.
+        self.history: list[dict[str, Any]] = []
 
     def load_skills(self, skills_path: Path) -> dict[str, dict[str, str]]:
         """Load the skill folders exposed to this agent."""
@@ -164,7 +169,51 @@ class Agent:
         # ``content`` of the skill file for ``invoke_skill``. Reject duplicate
         # names and malformed or missing frontmatter with a clear
         # ``ValueError``.
-        raise NotImplementedError
+        if not skills_path.is_dir():
+            raise ValueError(f"skills_path is not a directory: {skills_path}")
+
+        skills: dict[str, dict[str, str]] = {}
+        for skill_dir in sorted(p for p in skills_path.iterdir() if p.is_dir()):
+            skill_file = skill_dir / "SKILL.md"
+            if not skill_file.is_file():
+                raise ValueError(f"Skill folder has no SKILL.md: {skill_dir}")
+            content = skill_file.read_text()
+
+            # Frontmatter is the YAML between a leading '---' line and the next.
+            lines = content.splitlines()
+            if not lines or lines[0].strip() != "---":
+                raise ValueError(f"{skill_file} is missing YAML frontmatter")
+            try:
+                end = next(
+                    i for i, line in enumerate(lines[1:], start=1)
+                    if line.strip() == "---"
+                )
+            except StopIteration:
+                raise ValueError(f"{skill_file} has unterminated frontmatter") from None
+            frontmatter_text = "\n".join(lines[1:end])
+            try:
+                frontmatter = yaml.safe_load(frontmatter_text)
+            except yaml.YAMLError as exc:
+                raise ValueError(f"{skill_file} has malformed frontmatter: {exc}") from exc
+
+            if not isinstance(frontmatter, dict):
+                raise ValueError(f"{skill_file} frontmatter must be a mapping")
+            name = frontmatter.get("name")
+            description = frontmatter.get("description")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"{skill_file} frontmatter needs a non-empty 'name'")
+            if not isinstance(description, str) or not description.strip():
+                raise ValueError(
+                    f"{skill_file} frontmatter needs a non-empty 'description'"
+                )
+            if name in skills:
+                raise ValueError(f"Duplicate skill name {name!r} in {skill_file}")
+
+            skills[name] = {
+                "metadata": f"name: {name}\ndescription: {description}",
+                "content": content,
+            }
+        return skills
 
     def query_language_model(self) -> dict[str, Any]:
         """Send one tool-enabled Chat Completions request and normalize it."""
@@ -227,7 +276,13 @@ class Agent:
 
         # You want to be careful about which attributes of the class you modify
         # here as they may also be handled by the subclasses.
-        raise NotImplementedError
+        # Read-only: the prompt is rebuilt from state on every call, so calling
+        # it (as the token estimator does) never changes the agent.
+        return [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": self.task_prompt},
+            *self.history,
+        ]
 
     def estimate_active_prompt_tokens(self) -> int:
         """Estimate the next prompt, calibrated by the provider's latest usage."""
@@ -336,7 +391,34 @@ class Agent:
             # and handles the threshold, and tracks compaction events for
             # logging.
 
-            raise NotImplementedError
+            while not self.finished:
+                if self.steps_taken >= self.step_limit:
+                    raise StepLimitError(
+                        f"Agent did not finish within {self.step_limit} steps."
+                    )
+
+                # Reason + act: one model call yields reasoning and tool calls.
+                message = self.query_language_model()
+                self.history.append(message)
+
+                tool_calls = message.get("tool_calls") or []
+                if tool_calls:
+                    # Observe: one linked tool message per call. The subclass
+                    # sets self.finished when a call ends the task.
+                    self.history.extend(self.execute_tool_calls(tool_calls))
+                else:
+                    # A reply with no tool call does nothing in the
+                    # environment. Keep it, and nudge the model to act, so the
+                    # next assistant message follows a user message.
+                    self.history.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your last reply did not call a tool. Continue "
+                                "the task by calling one of the available tools."
+                            ),
+                        }
+                    )
         finally:
             # This block is provided infrastructure. Do not modify it: a
             # trajectory is required even when a run fails.
