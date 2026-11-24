@@ -107,9 +107,10 @@ class ChessAgent(Agent):
         )
 
         # TODO(Part 3): Register the play_move tool schema from tools.py.
+        self.tools.append(PLAY_MOVE_TOOL)
 
         if programmatic_tools:
-            self.tools.append(RUN_PYTHON_TOOL)
+            self.tools.extend([SIMULATE_MOVE_TOOL, RUN_PYTHON_TOOL])
 
         # run_python always executes in the sandbox, on the port the chess
         # server is listening on there.
@@ -177,4 +178,70 @@ class ChessAgent(Agent):
 
         # TODO(Part 3.3-4): add cases for simulate_move and run_python, with
         # linked observations and recoverable errors, just like the old tool.
-        raise NotImplementedError
+
+        # play_move and run_python can both change the live board, so only the
+        # first of them in one response runs; later ones would act on a
+        # position the model has not seen yet.
+        self._board_changed_this_turn = False
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": call.get("id", ""),
+                "content": self._run_tool_call(call),
+            }
+            for call in tool_calls
+        ]
+
+    def _run_tool_call(self, call: dict[str, Any]) -> str:
+        """Run one tool call and return its observation text."""
+
+        function = call.get("function") or {}
+        name = function.get("name")
+        arguments = function.get("arguments") or "{}"
+        known = {tool["function"]["name"] for tool in self.tools}
+        if name not in known:
+            return (
+                f"<chess_error>Unknown tool {name!r}. Available tools: "
+                f"{', '.join(sorted(known))}.</chess_error>"
+            )
+
+        if name == "invoke_skill":
+            return _invoke_skill(self.skills, arguments)
+        if name == "simulate_move":
+            return _simulate_move(self.chess_client, arguments)
+
+        # Only play_move and run_python are left; both may change the board.
+        if self.finished:
+            return "<chess_error>The game is over; no more moves can be played.</chess_error>"
+        if self._board_changed_this_turn:
+            return (
+                "<chess_error>Only one move-making call runs per response, and an "
+                "earlier call already ran. Read the new position and try again."
+                "</chess_error>"
+            )
+
+        if name == "play_move":
+            result = _play_move(self.chess_client, arguments)
+            if result.startswith("<chess_error>"):
+                return result
+            self._board_changed_this_turn = True
+            self._update_state(json.loads(result))
+            return self.format_state(self.last_state)
+
+        # run_python
+        result = _run_python(self.env, self.python_sandbox_port, arguments)
+        if result.startswith("<chess_error>"):
+            return result
+        # The snippet may have played a move, so re-read the live board.
+        self._board_changed_this_turn = True
+        try:
+            self._update_state(_game_state(self.chess_client))
+        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+            return f"{result}\n<chess_error>Could not re-read the board: {exc}</chess_error>"
+        return f"{result}\n{self.format_state(self.last_state)}"
+
+    def _update_state(self, state: dict[str, Any]) -> None:
+        """Remember the latest live position and whether the game has ended."""
+
+        self.last_state = state
+        self.finished = bool(state.get("game_over"))

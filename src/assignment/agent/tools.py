@@ -133,10 +133,89 @@ INVOKE_SKILL_TOOL = {
 # TODO(3.1.a): Define an OpenAI function-tool schema named ``play_move``.
 # It must accept exactly one required string argument named ``move``, explain
 # that moves use UCI notation (for example e2e4), and reject extra arguments.
-PLAY_MOVE_TOOL: dict = {}
+PLAY_MOVE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "play_move",
+        "description": (
+            "Play one move as White on the live game board. The opponent (Black) "
+            "replies automatically, and the new position is returned."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "move": {
+                    "type": "string",
+                    "description": (
+                        "The move in UCI notation: source square then target "
+                        "square, for example `e2e4`, plus a promotion piece "
+                        "letter when a pawn promotes, for example `e7e8q`."
+                    ),
+                },
+            },
+            "required": ["move"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # TODO(3.3): Define the `simulate_move` tool, like the `play_move` tool.
-SIMULATE_MOVE_TOOL: dict = {}
+SIMULATE_MOVE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "simulate_move",
+        "description": (
+            "Inspect a chess position, or play one hypothetical ply from it, "
+            "without changing the live game. Returns JSON with `fen`, `squares`, "
+            "`turn`, `legal_moves`, and terminal-result fields. Works for "
+            "either side to move, so chain the returned `fen` to look ahead."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fen": {
+                    "type": "string",
+                    "description": "A complete six-field FEN string for the position.",
+                },
+                "move": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Optional UCI move to apply, for example `e2e4` or "
+                        "`e7e8q`. Use null to only inspect the position."
+                    ),
+                },
+            },
+            "required": ["fen", "move"],
+            "additionalProperties": False,
+        },
+    },
+}
 
-# TODO()
-RUN_PYTHON_TOOL: dict = {}
+# Programmatic tool calling: the model writes Python that calls the tools above.
+RUN_PYTHON_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "run_python",
+        "description": (
+            "Run a Python snippet in the sandbox beside the chess server. "
+            "`simulate_move(fen, move=None)` and `play_move(move)` are already "
+            "defined as ordinary synchronous functions that return dicts and "
+            "raise on errors; do not import them. Returns JSON with the "
+            "snippet's `stdout`, `stderr`, and `error`, followed by the live board."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The Python source to run. Use print() to see values.",
+                },
+            },
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+    },
+}
